@@ -146,7 +146,7 @@ const (
 	NackDBOperationFailed            = 552
 )
 
-func (cli *Client) sendAck(ctx context.Context, node *waBinary.Node, error int) {
+func buildAckAttrs(node *waBinary.Node, error int) (waBinary.Attrs, bool) {
 	attrs := waBinary.Attrs{
 		"class": node.Tag,
 		"id":    node.Attrs["id"],
@@ -167,11 +167,30 @@ func (cli *Client) sendAck(ctx context.Context, node *waBinary.Node, error int) 
 			}
 		}
 	}
+	suppressedStatusMediaType := false
 	if receiptType, ok := node.Attrs["type"]; node.Tag != "message" && ok {
-		attrs["type"] = receiptType
+		// WhatsApp rejects <ack class="status" type="media"> by closing the
+		// stream. A plain ACK is enough to advance the status stanza and avoids
+		// putting the offline queue into a reconnect loop.
+		if node.Tag == "status" && receiptType == "media" {
+			suppressedStatusMediaType = true
+		} else {
+			attrs["type"] = receiptType
+		}
 	}
 	if error != 0 {
 		attrs["error"] = error
+	}
+	return attrs, suppressedStatusMediaType
+}
+
+func (cli *Client) sendAck(ctx context.Context, node *waBinary.Node, error int) {
+	attrs, suppressedStatusMediaType := buildAckAttrs(node, error)
+	if suppressedStatusMediaType {
+		cli.Log.Warnf(
+			"Sending plain acknowledgement for status media stanza %s to avoid a stream error",
+			node.Attrs["id"],
+		)
 	}
 	err := cli.sendNode(ctx, waBinary.Node{
 		Tag:   "ack",
