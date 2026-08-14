@@ -16,6 +16,33 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
+const streamErrorReconnectDelay = 2 * time.Second
+
+func (cli *Client) reconnectAfterStreamError(ctx context.Context, code string) {
+	// Mark the disconnect as expected before scheduling any asynchronous work.
+	// The socket EOF can race this goroutine; setting the flag synchronously
+	// prevents the normal auto-reconnect path from opening a second connection
+	// without the quiescence delay.
+	cli.expectDisconnect()
+	go func() {
+		// Stop the old socket as an expected disconnect so its EOF callback can't
+		// race an immediate auto-reconnect. WhatsApp needs a short window to retire
+		// the previous stream; reconnecting immediately can authenticate while the
+		// offline queue remains blocked behind the same stanza.
+		cli.Disconnect()
+		timer := time.NewTimer(streamErrorReconnectDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if err := cli.ConnectContext(ctx); err != nil {
+			cli.Log.Errorf("Failed to reconnect after stream error %q: %v", code, err)
+		}
+	}()
+}
+
 func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 	cli.isLoggedIn.Store(false)
 	cli.clearResponseWaiters(node)
@@ -50,9 +77,8 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 		cli.Log.Infof("Got replaced stream error, sending StreamReplaced event")
 		go cli.dispatchEvent(&events.StreamReplaced{})
 	case code == "503":
-		// This seems to happen when the server wants to restart or something.
-		// The disconnection will be emitted as an events.Disconnected and then the auto-reconnect will do its thing.
-		cli.Log.Warnf("Got 503 stream error, assuming automatic reconnect will handle it")
+		cli.Log.Warnf("Got 503 stream error, reconnecting after a clean shutdown")
+		cli.reconnectAfterStreamError(ctx, code)
 	case cli.RefreshCAT != nil && (code == events.ConnectFailureCATInvalid.NumberString() || code == events.ConnectFailureCATExpired.NumberString()):
 		cli.Log.Infof("Got %s stream error, refreshing CAT before reconnecting...", code)
 		cli.socketLock.RLock()
@@ -72,6 +98,7 @@ func (cli *Client) handleStreamError(ctx context.Context, node *waBinary.Node) {
 		}
 		cli.Log.Errorf("Unknown stream error: %s", node)
 		go cli.dispatchEvent(&events.StreamError{Code: code, Raw: node})
+		cli.reconnectAfterStreamError(ctx, code)
 	}
 }
 

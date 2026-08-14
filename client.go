@@ -288,7 +288,11 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 	}
 	cli.paired.Store(deviceStore.ID != nil)
 	cli.nodeHandlers = map[string]nodeHandler{
-		"message":      cli.handleEncryptedMessage,
+		"message": cli.handleEncryptedMessage,
+		// WhatsApp can deliver stories as standalone <status type="media">
+		// stanzas. They still need a protocol ACK even when applications ignore
+		// status events, otherwise the stanza blocks the offline queue.
+		"status":       cli.handleStandaloneStatus,
 		"appdata":      cli.handleEncryptedMessage,
 		"receipt":      cli.handleReceipt,
 		"call":         cli.handleCallEvent,
